@@ -45,6 +45,12 @@ reward:
   rlaif_weight: 0.3
   format_weight: 0.2
   required_sections:
-    - "\u601d\u8def"
-    - "\u6b65\u9aa4"
-    - "\u7b54\u6848"
+    - 思路
+    - 步骤
+    - 答案
+llamafactory:
+  cli_path: llamafactory-cli
+  dataset_dir: data/llamafactory
+  template: qwen
+  train_args: {}
+  export_args: {}

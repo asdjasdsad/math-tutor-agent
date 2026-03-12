@@ -24,12 +24,14 @@ def test_sft_config_instantiation() -> None:
     structured = dataclass_from_dict(SFTStageConfig, config)
     assert structured.model.base_model_name
     assert structured.training.max_seq_length == 2048
+    assert structured.llamafactory.dataset_dir.endswith("llamafactory")
 
 
 def test_reward_config_instantiation() -> None:
     config = load_stage_config("configs/reward.yaml", "configs/paths.yaml")
     structured = dataclass_from_dict(RewardStageConfig, config)
     assert structured.training.model_dir.endswith("model")
+    assert structured.llamafactory.cli_path == "llamafactory-cli"
 
 
 def test_ppo_grpo_config_instantiation() -> None:

@@ -21,7 +21,7 @@ data:
   max_train_samples: 20000
   max_eval_samples: 512
   val_ratio: 0.02
-  system_prompt: "\u4f60\u662f\u4e00\u540d\u8010\u5fc3\u3001\u4e25\u8c28\u3001\u64c5\u957f\u5206\u6b65\u8bb2\u89e3\u7684\u6570\u5b66\u8001\u5e08\u3002\u8bf7\u6309\u201c\u9898\u610f\u7406\u89e3\u3001\u601d\u8def\u3001\u6b65\u9aa4\u3001\u7b54\u6848\u3001\u603b\u7ed3\u201d\u7ed3\u6784\u4f5c\u7b54\uff0c\u5e76\u786e\u4fdd\u6700\u7ec8\u7b54\u6848\u660e\u786e\u3002"
+  system_prompt: "你是一名耐心、严谨、擅长分步讲解的数学老师。请按“题意理解、思路、步骤、答案、总结”结构作答，并确保最终答案明确。"
 training:
   output_dir: outputs/sft
   logging_dir: outputs/sft/tensorboard
@@ -63,3 +63,10 @@ lora:
     - gate_proj
     - up_proj
     - down_proj
+llamafactory:
+  cli_path: llamafactory-cli
+  dataset_dir: data/llamafactory
+  template: qwen
+  train_args: {}
+  export_args:
+    export_size: 2

@@ -1,20 +1,27 @@
-"""PPO baseline training entrypoint."""
+"""PPO training entrypoint backed by LLaMA-Factory."""
 
 from __future__ import annotations
 
 import argparse
-import json
 import math
-from dataclasses import dataclass
-from itertools import cycle
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from src.data.loaders import dataset_from_records, maybe_load_processed_dataset
 from src.data.preprocess_rl import preprocess_rl_from_config
-from src.rewards.combined import CombinedReward, RewardWeights
-from src.rewards.rlaif_reward import RLAIFReward
-from src.utils.gpu_monitor import get_peak_memory_gb, reset_peak_memory, snapshot_gpu_state
+from src.models.model_utils import resolve_model_name
+from src.trainers.llamafactory_runner import (
+    LlamaFactoryConfig,
+    detect_reward_model_type,
+    infer_template,
+    load_jsonl_rows,
+    merge_recipe,
+    prepare_dataset_dir,
+    register_dataset,
+    run_recipe,
+    save_recipe,
+    write_ppo_dataset,
+)
 from src.utils.io import (
     dataclass_from_dict,
     ensure_dir,
@@ -24,8 +31,7 @@ from src.utils.io import (
     save_git_state,
     save_jsonl,
 )
-from src.utils.logging import MetricsLogger, setup_logger
-from src.utils.profiling import Stopwatch, safe_rate
+from src.utils.logging import setup_logger
 from src.utils.seed import seed_everything
 
 
@@ -87,6 +93,16 @@ class RewardConfig:
 
 
 @dataclass
+class LoraConfig:
+    enabled: bool = False
+    r: int = 16
+    alpha: int = 32
+    dropout: float = 0.05
+    bias: str = "none"
+    target_modules: list[str] = field(default_factory=list)
+
+
+@dataclass
 class PPOStageConfig:
     stage_name: str
     seed: int
@@ -94,94 +110,66 @@ class PPOStageConfig:
     data: DataConfig
     training: TrainingConfig
     reward: RewardConfig
-    paths: dict[str, Any]
+    lora: LoraConfig = field(default_factory=LoraConfig)
+    llamafactory: LlamaFactoryConfig = field(default_factory=LlamaFactoryConfig)
+    paths: dict[str, Any] = field(default_factory=dict)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run PPO baseline training.")
+    parser = argparse.ArgumentParser(description="Run PPO training with LLaMA-Factory.")
     parser.add_argument("--config", required=True, help="Path to configs/ppo.yaml")
     parser.add_argument("--paths-config", default="configs/paths.yaml", help="Path to shared paths config")
     parser.add_argument("--override", action="append", default=[], help="Dotted config override")
     return parser.parse_args()
 
 
-def prepare_dataset(raw_config: dict[str, Any], config: PPOStageConfig, tokenizer: Any):
-    """Load or preprocess RL prompt data and tokenize prompts."""
+def load_config(args: argparse.Namespace) -> tuple[dict[str, Any], PPOStageConfig]:
+    raw_config = load_stage_config(args.config, args.paths_config, args.override)
+    structured = dataclass_from_dict(PPOStageConfig, raw_config)
+    return raw_config, structured
+
+
+def prepare_datasets(raw_config: dict[str, Any], config: PPOStageConfig) -> tuple[Path, str, str]:
+    """Ensure processed RL prompts exist and emit an Alpaca-style dataset."""
 
     project_root = raw_config["paths"]["project_root"]
     train_path = resolve_path(config.data.input_file, project_root)
+    eval_path = resolve_path(config.data.eval_file, project_root)
 
-    train_dataset = maybe_load_processed_dataset(train_path) if config.data.use_processed_if_available else None
-    if train_dataset is None:
+    if not (config.data.use_processed_if_available and train_path.exists() and eval_path.exists()):
         train_rows, eval_rows = preprocess_rl_from_config(raw_config)
         save_jsonl(train_path, train_rows)
-        save_jsonl(resolve_path(config.data.eval_file, project_root), eval_rows)
-        train_dataset = dataset_from_records(train_rows)
+        save_jsonl(eval_path, eval_rows)
 
-    def _tokenize(example: dict[str, Any]) -> dict[str, Any]:
-        encoded = tokenizer(
-            example["prompt"],
-            truncation=True,
-            max_length=config.data.max_prompt_length,
-        )
-        return {
-            "query": example["prompt"],
-            "answer": example.get("answer", ""),
-            "input_ids": encoded["input_ids"],
-        }
+    dataset_dir = prepare_dataset_dir(config.llamafactory.dataset_dir, project_root)
+    train_output = write_ppo_dataset(load_jsonl_rows(train_path), dataset_dir / "ppo_train.jsonl")
+    eval_output = write_ppo_dataset(load_jsonl_rows(eval_path), dataset_dir / "ppo_eval.jsonl")
 
-    return train_dataset.map(_tokenize, num_proc=config.data.num_proc)
-
-
-def _collator(features: list[dict[str, Any]]) -> dict[str, list[Any]]:
-    return {key: [feature[key] for feature in features] for key in features[0]}
-
-
-def _load_resume_step(output_dir: Path, resume_from_checkpoint: str | None) -> int:
-    if resume_from_checkpoint:
-        state_path = Path(resume_from_checkpoint) / "rl_state.json"
-    else:
-        state_path = output_dir / "rl_state.json"
-    if state_path.exists():
-        with state_path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        return int(payload.get("step", 0))
-    return 0
+    train_name = f"{config.stage_name}_train"
+    eval_name = f"{config.stage_name}_eval"
+    definition = {
+        "formatting": "alpaca",
+        "columns": {
+            "prompt": "instruction",
+            "query": "input",
+            "response": "output",
+        },
+    }
+    register_dataset(dataset_dir, train_name, {**definition, "file_name": train_output.name})
+    register_dataset(dataset_dir, eval_name, {**definition, "file_name": eval_output.name})
+    return dataset_dir, train_name, eval_name
 
 
-def _save_rl_state(path: Path, step: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump({"step": step}, handle, ensure_ascii=False, indent=2)
-
-
-def main() -> None:
-    args = parse_args()
-    raw_config = load_stage_config(args.config, args.paths_config, args.override)
-    config = dataclass_from_dict(PPOStageConfig, raw_config)
-    seed_everything(config.seed)
+def build_training_recipe(
+    raw_config: dict[str, Any],
+    config: PPOStageConfig,
+    dataset_dir: Path,
+    train_name: str,
+    eval_name: str,
+) -> dict[str, Any]:
+    """Translate project config into a LLaMA-Factory PPO recipe."""
 
     project_root = raw_config["paths"]["project_root"]
-    output_dir = ensure_dir(resolve_path(config.training.output_dir, project_root))
-    policy_dir = ensure_dir(resolve_path(config.training.policy_dir, project_root))
-    checkpoint_root = ensure_dir(resolve_path(config.training.checkpoint_dir, project_root))
-    logger = setup_logger("train_ppo", output_dir / "train.log")
-    metrics_logger = MetricsLogger(output_dir / "metrics.jsonl")
-
-    save_config_snapshot(output_dir, raw_config)
-    save_git_state(output_dir, project_root)
-    reset_peak_memory()
-
-    import torch
-    from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer, create_reference_model
-
-    from src.models.model_utils import (
-        get_model_device,
-        get_torch_dtype,
-        load_tokenizer,
-        resolve_model_name,
-    )
-
     policy_path = resolve_model_name(
         config.model.policy_model_name,
         fallback_model_name=config.model.fallback_model_name,
@@ -189,113 +177,79 @@ def main() -> None:
     if config.training.resume_from_checkpoint:
         policy_path = config.training.resume_from_checkpoint
 
-    tokenizer = load_tokenizer(policy_path, trust_remote_code=config.model.trust_remote_code)
-    train_dataset = prepare_dataset(raw_config, config, tokenizer)
+    reward_candidate = resolve_path(config.reward.reward_model_path, project_root)
+    reward_model = str(reward_candidate) if reward_candidate.exists() else config.reward.reward_model_path
+    reward_type = detect_reward_model_type(reward_model) if Path(reward_model).exists() else "full"
+    policy_dir = resolve_path(config.training.policy_dir, project_root)
+    total_updates = math.ceil(config.training.total_episodes / max(config.training.batch_size, 1))
 
-    model = AutoModelForCausalLMWithValueHead.from_pretrained(
-        policy_path,
-        trust_remote_code=config.model.trust_remote_code,
-        torch_dtype=get_torch_dtype(config.model.compute_dtype),
-    )
-    ref_model = create_reference_model(model)
-
-    ppo_config = PPOConfig(
-        model_name=policy_path,
-        learning_rate=config.training.learning_rate,
-        batch_size=config.training.batch_size,
-        mini_batch_size=config.training.mini_batch_size,
-        gradient_accumulation_steps=config.training.gradient_accumulation_steps,
-        ppo_epochs=config.training.ppo_epochs,
-        target_kl=config.training.target_kl,
-    )
-
-    ppo_trainer = PPOTrainer(
-        config=ppo_config,
-        model=model,
-        ref_model=ref_model,
-        tokenizer=tokenizer,
-        dataset=train_dataset,
-        data_collator=_collator,
-    )
-
-    reward_model_path = resolve_path(config.reward.reward_model_path, project_root)
-    rlaif = RLAIFReward(str(reward_model_path)) if reward_model_path.exists() else None
-    combined_reward = CombinedReward(
-        weights=RewardWeights(
-            correctness=config.reward.correctness_weight,
-            rlaif=config.reward.rlaif_weight,
-            format=config.reward.format_weight,
-        ),
-        required_sections=config.reward.required_sections,
-        rlaif_scorer=rlaif,
-    )
-
-    start_step = _load_resume_step(output_dir, config.training.resume_from_checkpoint)
-    total_updates = math.ceil(config.training.total_episodes / config.training.batch_size)
-    dataloader = cycle(ppo_trainer.dataloader)
-    generation_kwargs = {
-        "max_new_tokens": config.training.generation_max_new_tokens,
+    recipe = {
+        "model_name_or_path": policy_path,
+        "trust_remote_code": config.model.trust_remote_code,
+        "reward_model": reward_model,
+        "reward_model_type": reward_type,
+        "stage": "ppo",
+        "do_train": True,
+        "do_eval": True,
+        "finetuning_type": "lora" if config.lora.enabled else "full",
+        "template": infer_template(policy_path, config.llamafactory.template),
+        "dataset_dir": str(dataset_dir),
+        "dataset": train_name,
+        "eval_dataset": eval_name,
+        "preprocessing_num_workers": config.data.num_proc,
+        "cutoff_len": config.data.max_prompt_length + config.training.generation_max_new_tokens,
+        "learning_rate": config.training.learning_rate,
+        "max_steps": total_updates,
+        "per_device_train_batch_size": config.training.mini_batch_size,
+        "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
+        "ppo_epochs": config.training.ppo_epochs,
+        "ppo_buffer_size": config.training.batch_size,
+        "target_kl": config.training.target_kl,
+        "logging_steps": config.training.logging_steps,
+        "save_steps": config.training.save_steps,
+        "output_dir": str(policy_dir),
+        "logging_dir": str(resolve_path(config.training.logging_dir, project_root)),
+        "plot_loss": True,
+        "overwrite_output_dir": False,
+        "resume_from_checkpoint": config.training.resume_from_checkpoint,
+        "seed": config.seed,
+        "bf16": config.training.bf16,
         "temperature": config.training.temperature,
         "top_p": config.training.top_p,
-        "do_sample": True,
-        "pad_token_id": tokenizer.pad_token_id,
-        "eos_token_id": tokenizer.eos_token_id,
+        "max_new_tokens": config.training.generation_max_new_tokens,
+        "lora_rank": config.lora.r if config.lora.enabled else None,
+        "lora_alpha": config.lora.alpha if config.lora.enabled else None,
+        "lora_dropout": config.lora.dropout if config.lora.enabled else None,
+        "lora_target": ",".join(config.lora.target_modules) if config.lora.target_modules else None,
     }
+    return merge_recipe(recipe, config.llamafactory.train_args)
 
-    device = get_model_device(model)
-    logger.info("Starting PPO training from step %s/%s", start_step, total_updates)
 
-    for step in range(start_step, total_updates):
-        batch = next(dataloader)
-        query_tensors = [torch.tensor(ids, device=device) for ids in batch["input_ids"]]
-        timer = Stopwatch()
-        timer.start()
-        response_tensors = ppo_trainer.generate(query_tensors, return_prompt=False, **generation_kwargs)
-        elapsed = timer.elapsed()
+def main() -> None:
+    args = parse_args()
+    raw_config, config = load_config(args)
+    seed_everything(config.seed)
 
-        responses = tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
-        prompts = batch["query"]
-        answers = batch["answer"]
-        component_rows = combined_reward.score_batch(prompts, responses, answers)
-        rewards = [torch.tensor(row["combined_reward"], device=device) for row in component_rows]
+    project_root = raw_config["paths"]["project_root"]
+    output_dir = ensure_dir(resolve_path(config.training.output_dir, project_root))
+    policy_dir = ensure_dir(resolve_path(config.training.policy_dir, project_root))
+    logger = setup_logger("train_ppo", output_dir / "train.log")
 
-        stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
-        try:
-            ppo_trainer.log_stats(stats, batch, rewards)
-        except Exception:
-            pass
+    save_config_snapshot(output_dir, raw_config)
+    save_git_state(output_dir, project_root)
 
-        generated_tokens = sum(len(tensor) for tensor in response_tensors)
-        prompt_tokens = sum(len(tensor) for tensor in query_tensors)
-        metric_row = {
-            "step": step + 1,
-            "mean_reward": sum(row["combined_reward"] for row in component_rows) / len(component_rows),
-            "mean_correctness_reward": sum(row["correctness_reward"] for row in component_rows) / len(component_rows),
-            "mean_rlaif_reward": sum(row["rlaif_reward"] for row in component_rows) / len(component_rows),
-            "mean_format_reward": sum(row["format_reward"] for row in component_rows) / len(component_rows),
-            "tokens_per_sec": safe_rate(prompt_tokens + generated_tokens, elapsed),
-            "samples_per_sec": safe_rate(len(prompts), elapsed),
-            "peak_memory_gb": get_peak_memory_gb(),
-            "elapsed_sec": elapsed,
-        }
-        if isinstance(stats, dict):
-            metric_row.update({key: float(value) for key, value in stats.items() if isinstance(value, (int, float))})
-        metrics_logger.log(metric_row)
+    logger.warning(
+        "PPO training now uses LLaMA-Factory reward model scoring. "
+        "Custom correctness/format/RLAIF weights are kept only for offline evaluation."
+    )
 
-        if (step + 1) % config.training.logging_steps == 0:
-            logger.info("PPO step %s/%s: mean_reward=%.4f", step + 1, total_updates, metric_row["mean_reward"])
+    dataset_dir, train_name, eval_name = prepare_datasets(raw_config, config)
+    recipe = build_training_recipe(raw_config, config, dataset_dir, train_name, eval_name)
+    recipe_path = save_recipe(output_dir / "llamafactory_train.yaml", recipe)
 
-        if (step + 1) % config.training.save_steps == 0:
-            checkpoint_dir = ensure_dir(checkpoint_root / f"step-{step + 1}")
-            ppo_trainer.model.save_pretrained(checkpoint_dir)
-            tokenizer.save_pretrained(checkpoint_dir)
-            _save_rl_state(checkpoint_dir / "rl_state.json", step + 1)
-
-    ppo_trainer.model.save_pretrained(policy_dir)
-    tokenizer.save_pretrained(policy_dir)
-    _save_rl_state(output_dir / "rl_state.json", total_updates)
-    metrics_logger.log({"event": "gpu_state", **snapshot_gpu_state()})
-    logger.info("PPO training finished. Policy saved to %s", policy_dir)
+    logger.info("Launching LLaMA-Factory PPO. output_dir=%s policy_dir=%s", output_dir, policy_dir)
+    run_recipe(config.llamafactory.cli_path, "train", recipe_path, workdir=project_root)
+    logger.info("PPO flow completed.")
 
 
 if __name__ == "__main__":

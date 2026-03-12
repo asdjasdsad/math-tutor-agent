@@ -9,7 +9,10 @@ from dataclasses import MISSING, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Iterable, TypeVar, Union, get_args, get_origin, get_type_hints
 
-import yaml
+try:
+    import yaml
+except ModuleNotFoundError:  # pragma: no cover - exercised only in minimal envs
+    yaml = None
 
 T = TypeVar("T")
 
@@ -21,6 +24,8 @@ class ConfigError(RuntimeError):
 def load_yaml(path: str | Path) -> dict[str, Any]:
     """Load a YAML file and return a dictionary."""
 
+    if yaml is None:
+        raise ModuleNotFoundError("PyYAML is required to load YAML config files.")
     with Path(path).open("r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle) or {}
     if not isinstance(payload, dict):
@@ -31,6 +36,8 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
 def save_yaml(path: str | Path, payload: dict[str, Any]) -> None:
     """Persist a mapping as UTF-8 YAML."""
 
+    if yaml is None:
+        raise ModuleNotFoundError("PyYAML is required to save YAML config files.")
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("w", encoding="utf-8") as handle:

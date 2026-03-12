@@ -1,0 +1,10 @@
+name: math-tutor-agent
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - git
+  - pip:
+      - -r requirements.txt
+      - git+https://github.com/hiyouga/LLaMA-Factory.git

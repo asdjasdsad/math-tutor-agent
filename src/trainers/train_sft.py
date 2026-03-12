@@ -1,4 +1,4 @@
-"""SFT training entrypoint for the math tutor agent."""
+"""SFT training entrypoint backed by LLaMA-Factory."""
 
 from __future__ import annotations
 
@@ -7,10 +7,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from src.data.loaders import dataset_from_records, maybe_load_processed_dataset
-from src.data.preprocess_sft import preprocess_sft_from_config, render_sft_text
-from src.data.schemas import UnifiedRecord
-from src.utils.gpu_monitor import reset_peak_memory, snapshot_gpu_state
+from src.data.preprocess_sft import DEFAULT_SYSTEM_PROMPT, preprocess_sft_from_config
+from src.trainers.llamafactory_runner import (
+    LlamaFactoryConfig,
+    infer_template,
+    load_jsonl_rows,
+    merge_recipe,
+    prepare_dataset_dir,
+    register_dataset,
+    run_recipe,
+    save_recipe,
+    write_sft_dataset,
+    build_export_recipe,
+)
 from src.utils.io import (
     dataclass_from_dict,
     ensure_dir,
@@ -20,7 +29,7 @@ from src.utils.io import (
     save_git_state,
     save_jsonl,
 )
-from src.utils.logging import MetricsLogger, setup_logger
+from src.utils.logging import setup_logger
 from src.utils.seed import seed_everything
 
 
@@ -49,7 +58,7 @@ class DataConfig:
     max_train_samples: int | None = None
     max_eval_samples: int | None = None
     val_ratio: float = 0.02
-    system_prompt: str = ""
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT
 
 
 @dataclass
@@ -99,11 +108,12 @@ class SFTStageConfig:
     data: DataConfig
     training: TrainingConfig
     lora: LoraConfig
-    paths: dict[str, Any]
+    llamafactory: LlamaFactoryConfig = field(default_factory=LlamaFactoryConfig)
+    paths: dict[str, Any] = field(default_factory=dict)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the SFT math tutor model.")
+    parser = argparse.ArgumentParser(description="Train the SFT model with LLaMA-Factory.")
     parser.add_argument("--config", required=True, help="Path to configs/sft.yaml")
     parser.add_argument("--paths-config", default="configs/paths.yaml", help="Path to shared paths config")
     parser.add_argument("--override", action="append", default=[], help="Dotted config override")
@@ -116,41 +126,92 @@ def load_config(args: argparse.Namespace) -> tuple[dict[str, Any], SFTStageConfi
     return raw_config, structured
 
 
-def prepare_dataset(raw_config: dict[str, Any], config: SFTStageConfig, tokenizer: Any):
-    """Load processed SFT data or preprocess it on the fly."""
+def prepare_datasets(raw_config: dict[str, Any], config: SFTStageConfig) -> tuple[Path, str, str]:
+    """Ensure processed data exists and emit a ShareGPT dataset for LLaMA-Factory."""
 
     project_root = raw_config["paths"]["project_root"]
     train_path = resolve_path(config.data.input_file, project_root)
     eval_path = resolve_path(config.data.eval_file, project_root)
 
-    train_dataset = maybe_load_processed_dataset(train_path) if config.data.use_processed_if_available else None
-    eval_dataset = maybe_load_processed_dataset(eval_path) if config.data.use_processed_if_available else None
-
-    if train_dataset is None or eval_dataset is None:
+    if not (config.data.use_processed_if_available and train_path.exists() and eval_path.exists()):
         train_rows, eval_rows = preprocess_sft_from_config(raw_config)
         save_jsonl(train_path, train_rows)
         save_jsonl(eval_path, eval_rows)
-        train_dataset = dataset_from_records(train_rows)
-        eval_dataset = dataset_from_records(eval_rows)
 
-    def _render(example: dict[str, Any]) -> dict[str, Any]:
-        record = UnifiedRecord(
-            prompt=example["prompt"],
-            response=example["response"],
-            answer=example.get("answer", ""),
-            metadata=example.get("metadata", {}),
-        )
-        return {
-            "text": render_sft_text(
-                record=record,
-                tokenizer=tokenizer,
-                system_prompt=config.data.system_prompt,
-            )
-        }
+    dataset_dir = prepare_dataset_dir(config.llamafactory.dataset_dir, project_root)
+    system_prompt = config.data.system_prompt or DEFAULT_SYSTEM_PROMPT
+    train_output = write_sft_dataset(load_jsonl_rows(train_path), dataset_dir / "sft_train.jsonl", system_prompt)
+    eval_output = write_sft_dataset(load_jsonl_rows(eval_path), dataset_dir / "sft_eval.jsonl", system_prompt)
 
-    train_dataset = train_dataset.map(_render, num_proc=config.data.num_proc)
-    eval_dataset = eval_dataset.map(_render, num_proc=config.data.num_proc)
-    return train_dataset, eval_dataset
+    train_name = f"{config.stage_name}_train"
+    eval_name = f"{config.stage_name}_eval"
+    definition = {
+        "formatting": "sharegpt",
+        "columns": {"messages": "messages"},
+    }
+    register_dataset(dataset_dir, train_name, {**definition, "file_name": train_output.name})
+    register_dataset(dataset_dir, eval_name, {**definition, "file_name": eval_output.name})
+    return dataset_dir, train_name, eval_name
+
+
+def build_training_recipe(
+    raw_config: dict[str, Any],
+    config: SFTStageConfig,
+    dataset_dir: Path,
+    train_name: str,
+    eval_name: str,
+) -> dict[str, Any]:
+    """Translate project config into a LLaMA-Factory SFT recipe."""
+
+    project_root = raw_config["paths"]["project_root"]
+    adapter_dir = resolve_path(config.training.adapter_dir, project_root)
+    template = infer_template(config.model.base_model_name, config.llamafactory.template)
+    recipe = {
+        "model_name_or_path": config.model.base_model_name,
+        "trust_remote_code": config.model.trust_remote_code,
+        "stage": "sft",
+        "do_train": True,
+        "do_eval": True,
+        "finetuning_type": "lora" if config.lora.enabled else "full",
+        "template": template,
+        "dataset_dir": str(dataset_dir),
+        "dataset": train_name,
+        "eval_dataset": eval_name,
+        "preprocessing_num_workers": config.data.num_proc,
+        "cutoff_len": config.training.max_seq_length,
+        "learning_rate": config.training.learning_rate,
+        "weight_decay": config.training.weight_decay,
+        "num_train_epochs": config.training.num_train_epochs,
+        "max_steps": config.training.max_steps,
+        "per_device_train_batch_size": config.training.per_device_train_batch_size,
+        "per_device_eval_batch_size": config.training.per_device_eval_batch_size,
+        "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
+        "lr_scheduler_type": config.training.lr_scheduler_type,
+        "warmup_ratio": config.training.warmup_ratio,
+        "logging_steps": config.training.logging_steps,
+        "save_steps": config.training.save_steps,
+        "eval_steps": config.training.eval_steps,
+        "save_total_limit": config.training.save_total_limit,
+        "output_dir": str(adapter_dir),
+        "logging_dir": str(resolve_path(config.training.logging_dir, project_root)),
+        "report_to": config.training.report_to,
+        "plot_loss": True,
+        "overwrite_output_dir": False,
+        "resume_from_checkpoint": config.training.resume_from_checkpoint,
+        "gradient_checkpointing": config.training.gradient_checkpointing,
+        "packing": config.training.packing,
+        "seed": config.seed,
+        "bf16": config.training.bf16,
+        "fp16": config.training.fp16,
+        "quantization_bit": 4 if config.model.use_4bit else None,
+        "double_quantization": config.model.bnb_4bit_use_double_quant if config.model.use_4bit else None,
+        "quantization_type": config.model.bnb_4bit_quant_type if config.model.use_4bit else None,
+        "lora_rank": config.lora.r if config.lora.enabled else None,
+        "lora_alpha": config.lora.alpha if config.lora.enabled else None,
+        "lora_dropout": config.lora.dropout if config.lora.enabled else None,
+        "lora_target": ",".join(config.lora.target_modules) if config.lora.target_modules else None,
+    }
+    return merge_recipe(recipe, config.llamafactory.train_args)
 
 
 def main() -> None:
@@ -162,119 +223,32 @@ def main() -> None:
     output_dir = ensure_dir(resolve_path(config.training.output_dir, project_root))
     adapter_dir = ensure_dir(resolve_path(config.training.adapter_dir, project_root))
     merged_dir = resolve_path(config.training.merged_dir, project_root)
-    checkpoints_dir = ensure_dir(output_dir / "checkpoints")
     logger = setup_logger("train_sft", output_dir / "train.log")
-    metrics_logger = MetricsLogger(output_dir / "metrics.jsonl")
 
     save_config_snapshot(output_dir, raw_config)
     save_git_state(output_dir, project_root)
-    reset_peak_memory()
 
-    logger.info("Loading tokenizer and model.")
-    from transformers import TrainingArguments
-    from trl import SFTTrainer
+    dataset_dir, train_name, eval_name = prepare_datasets(raw_config, config)
+    recipe = build_training_recipe(raw_config, config, dataset_dir, train_name, eval_name)
+    recipe_path = save_recipe(output_dir / "llamafactory_train.yaml", recipe)
 
-    from src.models.lora_utils import build_lora_config
-    from src.models.merge_lora import merge_adapter
-    from src.models.model_utils import load_causal_lm, load_tokenizer
-
-    tokenizer = load_tokenizer(
-        model_name_or_path=config.model.base_model_name,
-        trust_remote_code=config.model.trust_remote_code,
-    )
-    train_dataset, eval_dataset = prepare_dataset(raw_config, config, tokenizer)
-
-    model = load_causal_lm(
-        model_name_or_path=config.model.base_model_name,
-        trust_remote_code=config.model.trust_remote_code,
-        use_4bit=config.model.use_4bit,
-        compute_dtype=config.model.compute_dtype,
-        bnb_4bit_quant_type=config.model.bnb_4bit_quant_type,
-        bnb_4bit_use_double_quant=config.model.bnb_4bit_use_double_quant,
-        attn_implementation=config.model.attn_implementation,
-        gradient_checkpointing=config.training.gradient_checkpointing,
-        use_cache=False,
-    )
-
-    peft_config = None
-    if config.lora.enabled:
-        peft_config = build_lora_config(
-            r=config.lora.r,
-            alpha=config.lora.alpha,
-            dropout=config.lora.dropout,
-            bias=config.lora.bias,
-            target_modules=config.lora.target_modules,
-        )
-
-    training_args = TrainingArguments(
-        output_dir=str(checkpoints_dir),
-        logging_dir=str(resolve_path(config.training.logging_dir, project_root)),
-        per_device_train_batch_size=config.training.per_device_train_batch_size,
-        per_device_eval_batch_size=config.training.per_device_eval_batch_size,
-        gradient_accumulation_steps=config.training.gradient_accumulation_steps,
-        learning_rate=config.training.learning_rate,
-        weight_decay=config.training.weight_decay,
-        num_train_epochs=config.training.num_train_epochs,
-        max_steps=config.training.max_steps,
-        warmup_ratio=config.training.warmup_ratio,
-        lr_scheduler_type=config.training.lr_scheduler_type,
-        logging_steps=config.training.logging_steps,
-        eval_steps=config.training.eval_steps,
-        save_steps=config.training.save_steps,
-        save_total_limit=config.training.save_total_limit,
-        bf16=config.training.bf16,
-        fp16=config.training.fp16,
-        gradient_checkpointing=config.training.gradient_checkpointing,
-        report_to=config.training.report_to,
-        evaluation_strategy="steps",
-        save_strategy="steps",
-        remove_unused_columns=False,
-        dataloader_num_workers=2,
-        logging_first_step=True,
-    )
-
-    trainer = SFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        dataset_text_field="text",
-        max_seq_length=config.training.max_seq_length,
-        peft_config=peft_config,
-        packing=config.training.packing,
-    )
-
-    resume_from = config.training.resume_from_checkpoint
-    logger.info("Starting SFT training. resume_from_checkpoint=%s", resume_from)
-    train_result = trainer.train(resume_from_checkpoint=resume_from)
-
-    logger.info("Saving adapter and tokenizer.")
-    trainer.model.save_pretrained(adapter_dir)
-    tokenizer.save_pretrained(adapter_dir)
-    trainer.save_state()
-    trainer.save_metrics("train", train_result.metrics)
-    trainer_state_path = checkpoints_dir / "trainer_state.json"
-    if trainer_state_path.exists():
-        (output_dir / "trainer_state.json").write_text(
-            trainer_state_path.read_text(encoding="utf-8"),
-            encoding="utf-8",
-        )
-    if trainer.state.log_history:
-        save_jsonl(output_dir / "metrics.jsonl", trainer.state.log_history)
-    metrics_logger.log({"event": "train_result", **train_result.metrics})
-    metrics_logger.log({"event": "gpu_state", **snapshot_gpu_state()})
+    logger.info("Launching LLaMA-Factory SFT. output_dir=%s adapter_dir=%s", output_dir, adapter_dir)
+    run_recipe(config.llamafactory.cli_path, "train", recipe_path, workdir=project_root)
 
     if config.training.auto_merge_after_training:
-        logger.info("Merging adapter into base model.")
-        merge_adapter(
+        export_recipe = build_export_recipe(
             base_model_name=config.model.base_model_name,
-            adapter_path=str(adapter_dir),
-            output_dir=str(merged_dir),
+            adapter_dir=adapter_dir,
+            export_dir=merged_dir,
+            template=infer_template(config.model.base_model_name, config.llamafactory.template),
             trust_remote_code=config.model.trust_remote_code,
+            overrides=config.llamafactory.export_args,
         )
+        export_path = save_recipe(output_dir / "llamafactory_export.yaml", export_recipe)
+        logger.info("Exporting merged model to %s", merged_dir)
+        run_recipe(config.llamafactory.cli_path, "export", export_path, workdir=project_root)
 
-    logger.info("SFT training completed. Adapter saved to %s", adapter_dir)
+    logger.info("SFT flow completed.")
 
 
 if __name__ == "__main__":
