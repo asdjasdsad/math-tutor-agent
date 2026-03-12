@@ -1,0 +1,61 @@
+stage_name: grpo
+seed: 42
+model:
+  policy_model_name: outputs/sft/merged
+  fallback_model_name: Qwen/Qwen2.5-1.5B-Instruct
+  trust_remote_code: true
+  use_4bit: true
+  compute_dtype: bfloat16
+data:
+  dataset_name: openai/gsm8k
+  dataset_config_name: main
+  train_split: train
+  eval_split: test
+  input_file: data/processed/rl_train.jsonl
+  eval_file: data/processed/rl_eval.jsonl
+  use_processed_if_available: true
+  cache_dir: data/cache
+  max_train_samples: 4000
+  max_eval_samples: 256
+  num_proc: 4
+training:
+  output_dir: outputs/grpo
+  logging_dir: outputs/grpo/tensorboard
+  policy_dir: outputs/grpo/policy
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-5
+  num_train_epochs: 1
+  max_steps: 256
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  logging_steps: 10
+  save_steps: 50
+  save_total_limit: 3
+  max_prompt_length: 512
+  max_completion_length: 256
+  num_generations: 4
+  group_size: 4
+  bf16: true
+  gradient_checkpointing: true
+  resume_from_checkpoint:
+reward:
+  reward_model_path: outputs/reward/model
+  correctness_weight: 0.5
+  rlaif_weight: 0.3
+  format_weight: 0.2
+  required_sections:
+    - "\u601d\u8def"
+    - "\u6b65\u9aa4"
+    - "\u7b54\u6848"
+lora:
+  enabled: true
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  bias: none
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj

@@ -1,0 +1,57 @@
+stage_name: reward
+seed: 42
+model:
+  base_model_name: Qwen/Qwen3-0.6B
+  trust_remote_code: true
+  use_4bit: true
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_use_double_quant: true
+  compute_dtype: bfloat16
+data:
+  dataset_name: trl-lib/ultrafeedback_binarized
+  dataset_config_name:
+  train_split: train
+  eval_split: train[:512]
+  input_file: data/processed/reward_train.jsonl
+  eval_file: data/processed/reward_eval.jsonl
+  use_processed_if_available: true
+  cache_dir: data/cache
+  num_proc: 4
+  max_train_samples: 30000
+  max_eval_samples: 512
+  max_length: 2048
+  prompt_template: "\u4e0b\u9762\u662f\u4e00\u9053\u6570\u5b66\u9898\u4e0e\u4e00\u4e2a\u5b66\u751f\u7b54\u6848\uff0c\u8bf7\u4ece\u6e05\u6670\u5ea6\u3001\u6b65\u9aa4\u5b8c\u6574\u6027\u3001\u6559\u5b66\u98ce\u683c\u548c\u7ed3\u8bba\u660e\u786e\u6027\u89d2\u5ea6\u7ed9\u51fa\u504f\u597d\u3002"
+training:
+  output_dir: outputs/reward
+  logging_dir: outputs/reward/tensorboard
+  model_dir: outputs/reward/model
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  num_train_epochs: 1
+  max_steps: -1
+  warmup_ratio: 0.05
+  lr_scheduler_type: cosine
+  logging_steps: 10
+  eval_steps: 100
+  save_steps: 100
+  save_total_limit: 3
+  bf16: true
+  fp16: false
+  gradient_checkpointing: true
+  resume_from_checkpoint:
+  report_to:
+    - tensorboard
+lora:
+  enabled: true
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  bias: none
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "math-tutor-agent"
+version = "0.1.0"
+description = "Single-GPU math tutor agent with SFT, reward modeling, PPO, GRPO, and vLLM deployment."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Codex" }]
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"

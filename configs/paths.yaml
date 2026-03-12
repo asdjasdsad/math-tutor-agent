@@ -1,0 +1,8 @@
+project_name: math-tutor-agent
+project_root: .
+data_root: data
+raw_data_dir: data/raw
+processed_data_dir: data/processed
+cache_dir: data/cache
+outputs_root: outputs
+reports_dir: reports

@@ -1,0 +1,50 @@
+stage_name: ppo
+seed: 42
+model:
+  policy_model_name: outputs/sft/merged
+  fallback_model_name: Qwen/Qwen2.5-1.5B-Instruct
+  trust_remote_code: true
+  use_4bit: false
+  compute_dtype: bfloat16
+data:
+  dataset_name: openai/gsm8k
+  dataset_config_name: main
+  train_split: train
+  eval_split: test
+  input_file: data/processed/rl_train.jsonl
+  eval_file: data/processed/rl_eval.jsonl
+  use_processed_if_available: true
+  cache_dir: data/cache
+  max_train_samples: 4000
+  max_eval_samples: 256
+  num_proc: 4
+  max_prompt_length: 512
+  max_answer_length: 128
+training:
+  output_dir: outputs/ppo
+  logging_dir: outputs/ppo/tensorboard
+  policy_dir: outputs/ppo/policy
+  checkpoint_dir: outputs/ppo/checkpoints
+  mini_batch_size: 1
+  batch_size: 4
+  gradient_accumulation_steps: 1
+  ppo_epochs: 1
+  learning_rate: 1.0e-5
+  target_kl: 0.1
+  total_episodes: 512
+  logging_steps: 10
+  save_steps: 50
+  bf16: true
+  generation_max_new_tokens: 256
+  temperature: 0.7
+  top_p: 0.9
+  resume_from_checkpoint:
+reward:
+  reward_model_path: outputs/reward/model
+  correctness_weight: 0.5
+  rlaif_weight: 0.3
+  format_weight: 0.2
+  required_sections:
+    - "\u601d\u8def"
+    - "\u6b65\u9aa4"
+    - "\u7b54\u6848"

@@ -1,0 +1,26 @@
+server:
+  model_name_or_path: outputs/sft/merged
+  fallback_model_name: Qwen/Qwen2.5-1.5B-Instruct
+  host: 0.0.0.0
+  port: 8000
+  tensor_parallel_size: 1
+  dtype: bfloat16
+  gpu_memory_utilization: 0.92
+  max_model_len: 4096
+  trust_remote_code: true
+  download_dir: data/cache/vllm
+  enable_prefix_caching: true
+  kv_cache_dtype: auto
+  swap_space: 4
+  enable_speculative_decoding: false
+  draft_model_name: Qwen/Qwen2.5-0.5B-Instruct
+generation:
+  temperature: 0.2
+  top_p: 0.9
+  max_tokens: 512
+  repetition_penalty: 1.05
+awq:
+  enabled: false
+  calibration_samples: 128
+  max_calibration_length: 1024
+  output_dir: outputs/awq
